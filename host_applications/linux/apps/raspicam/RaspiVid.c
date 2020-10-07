@@ -225,6 +225,13 @@ struct RASPIVID_STATE_S
    bool netListen;
    MMAL_BOOL_T addSPSTiming;
    int slices;
+   
+   // Added by Inatech
+   MMAL_BOOL_T isPtsAppendedToFrame;
+   MMAL_BOOL_T isPllEnabled;
+   MMAL_BOOL_T isPllVerbose;
+   int pllLittleStepSize;
+   int pllBigStepSize;
 };
 
 
@@ -308,7 +315,13 @@ enum
    CommandRawFormat,
    CommandNetListen,
    CommandSPSTimings,
-   CommandSlices
+   CommandSlices,
+   // Added by Inatech
+   CommandAppendPtsToFrame,
+   CommandPllEnabled,
+   CommandPllVerbose,
+   CommandPllLittleStep,
+   CommandPllBigStep
 };
 
 static COMMAND_LIST cmdline_commands[] =
@@ -342,6 +355,13 @@ static COMMAND_LIST cmdline_commands[] =
    { CommandNetListen,     "-listen",     "l", "Listen on a TCP socket", 0},
    { CommandSPSTimings,    "-spstimings",    "stm", "Add in h.264 sps timings", 0},
    { CommandSlices   ,     "-slices",     "sl", "Horizontal slices per frame. Default 1 (off)", 1},
+   // Added by Inatech
+   // Last struct member: 0/1 = no parameter/has parameter
+   { CommandAppendPtsToFrame, "-add-pts-to-frame", "apf", "Append PTS value to frame data (Only useful for MJPEG)", 0}, 
+   { CommandPllEnabled,    "-pll-on",     "pll",   "Enable software PLL", 0 },
+   { CommandPllVerbose,    "-pll-v",      "pllv",  "Enable PLL debug output", 0},
+   { CommandPllLittleStep, "-pll-step1",  "plls1", "PLL framerate correction when drift > 0.1ms", 1},
+   { CommandPllBigStep,    "-pll-step2",  "plls2", "PLL framerate correction when drift > 1ms", 1}
 };
 
 static int cmdline_commands_size = sizeof(cmdline_commands) / sizeof(cmdline_commands[0]);
@@ -413,6 +433,13 @@ static void default_status(RASPIVID_STATE *state)
    state->netListen = false;
    state->addSPSTiming = MMAL_FALSE;
    state->slices = 1;
+   
+   // Added by Inatech
+   state->isPtsAppendedToFrame = MMAL_FALSE;
+   state->isPllEnabled = MMAL_FALSE;
+   state->isPllVerbose = MMAL_FALSE;
+   state->pllLittleStepSize = 500;
+   state->pllBigStepSize = 1000;
 
 
    // Setup preview window defaults
@@ -923,6 +950,43 @@ static int parse_cmdline(int argc, const char **argv, RASPIVID_STATE *state)
 
          break;
       }
+      
+      // Added by Inatech
+      case CommandAppendPtsToFrame:
+      {
+         state->isPtsAppendedToFrame = MMAL_TRUE;
+         break;
+      }
+      
+      case CommandPllEnabled:
+      {
+         state->isPllEnabled = MMAL_TRUE;
+         break;
+      }
+      
+      case CommandPllVerbose:
+      {
+         state->isPllVerbose = MMAL_TRUE;
+         break;
+      }
+      
+      case CommandPllLittleStep:
+      {
+         if (sscanf(argv[i + 1], "%d", &state->pllLittleStepSize) == 1)
+            i++;
+         else
+            valid = 0;
+         break;
+      }
+      
+      case CommandPllBigStep:
+      {
+         if (sscanf(argv[i + 1], "%d", &state->pllBigStepSize) == 1)
+            i++;
+         else
+            valid = 0;
+         break;
+      }
 
       default:
       {
@@ -1194,6 +1258,19 @@ static void update_annotation_data(RASPIVID_STATE *state)
    }
 }
 
+uint64_t get_sysclock()
+{
+   struct timespec spec;
+   uint64_t us;
+
+   clock_gettime(CLOCK_REALTIME, &spec);
+
+   us = ((uint64_t)spec.tv_sec) * 1000000UL;
+   us += spec.tv_nsec / 1000;
+
+   return us;
+}
+
 /**
  *  buffer header callback function for encoder
  *
@@ -1376,6 +1453,91 @@ static void encoder_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buf
             else
             {
                bytes_written = fwrite(buffer->data, 1, buffer->length, pData->file_handle);
+
+               // ### Start of Inatech modification
+               // # Step1: sync VideoCore MMAL internal time with CPU system time
+               uint64_t mmal_time = 0;
+               mmal_port_parameter_get_uint64(port, MMAL_PARAMETER_SYSTEM_TIME, &mmal_time);
+               uint64_t syst_time = get_sysclock();
+               int64_t mmal_time_offset = mmal_time - syst_time;
+               int64_t pts_sys_time =  buffer->pts - mmal_time_offset;
+               
+               if(pData->pstate->isPtsAppendedToFrame == MMAL_TRUE) {
+                   // write SYSCLK_PTS time after video frame
+                   // Note: this will corrupt the stream if not read by approriate tool
+                   fwrite(&pts_sys_time, 1, sizeof(int64_t), pData->file_handle);
+               }
+
+               // # Step2: calculate framerate correction by comparing the delay
+               // between camera and system times
+               const int requested_framerate = pData->pstate->framerate;
+               const uint32_t framerate_den = 1000;
+               const uint32_t framerate_num = requested_framerate * framerate_den;
+
+               //const uint32_t deadzone0 = 10000; // 10ms
+               const uint32_t deadzone1 = 1000;  // 1ms
+               const uint32_t deadzone2 = 100;   // 0.1ms (100us)
+
+               // Example: with 100fps => 10ms between frame (=frame time)
+               // Note: syst_time is in us, hence 10ms = 10,000us
+               const uint32_t frame_time_us = 1000000 / requested_framerate;
+               uint32_t mmal_delay_raw = (pts_sys_time % frame_time_us);
+               int32_t mmal_delay = mmal_delay_raw < (frame_time_us/2) ?
+                                    mmal_delay_raw :
+                                    -(frame_time_us - mmal_delay_raw);
+
+               int32_t framerate_cor = 0;
+               // 'deadzone0' is disabled for now
+               //if(mmal_delay < 0 && mmal_delay < -deadzone0)
+               //{
+               //   framerate_cor = -1000;
+               //}
+               //else
+               //if(mmal_delay > 0 && mmal_delay > deadzone0)
+               //{
+               //   framerate_cor = 1000;
+               //}
+               //else
+               if(mmal_delay < 0 && mmal_delay < -deadzone1)
+               {
+                   framerate_cor = -(pData->pstate->pllBigStepSize);
+               }
+               else
+               if(mmal_delay > 0 && mmal_delay > deadzone1)
+               {
+                   framerate_cor = (pData->pstate->pllBigStepSize);
+               }
+               else
+               if(mmal_delay < 0 && mmal_delay < -deadzone2)
+               {
+                   framerate_cor = -(pData->pstate->pllLittleStepSize);
+               }
+               else
+               if(mmal_delay > 0 && mmal_delay > deadzone2)
+               {
+                   framerate_cor = (pData->pstate->pllBigStepSize);
+               }
+    
+               // # Step3: If software PLL is enabled, apply framerate correction
+               // to MMAL camera video port
+               if(pData->pstate->isPllEnabled == MMAL_TRUE)
+               {
+                  MMAL_PARAMETER_FRAME_RATE_T param = {{MMAL_PARAMETER_VIDEO_FRAME_RATE, sizeof(param)}, {0, 0}};
+                  param.frame_rate.num = framerate_num + framerate_cor;
+                  param.frame_rate.den = framerate_den;
+                  // set new framerate with correction
+                  mmal_port_parameter_set(pData->pstate->camera_component->output[MMAL_CAMERA_VIDEO_PORT], &param.hdr);
+               }
+    
+               // # Step4: log results
+               static uint32_t frameIdx = 0;
+               if(pData->pstate->isPllVerbose == MMAL_TRUE)
+               {
+                  printf("f:%d, d:%+.5d, c:%d\n", requested_framerate, mmal_delay, framerate_cor);
+               }
+               frameIdx++;
+               // ### End of Inatech modification
+
                if(pData->flush_buffers)
                {
                    fflush(pData->file_handle);
@@ -1388,11 +1550,18 @@ static void encoder_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buf
                   buffer->pts != pData->pstate->lasttime)
                {
                   int64_t pts;
-                  if (pData->pstate->frame == 0)
+                  if (pData->pstate->frame == 0) {
                      pData->pstate->starttime = buffer->pts;
+                  }
+                  int64_t dpts = buffer->pts - pData->pstate->lasttime;
                   pData->pstate->lasttime = buffer->pts;
                   pts = buffer->pts - pData->pstate->starttime;
-                  fprintf(pData->pts_file_handle, "%lld.%03lld\n", pts/1000, pts%1000);
+                  //fprintf(pData->pts_file_handle, "%lld.%03lld\n", pts/1000, pts%1000);
+
+                  fprintf(pData->pts_file_handle,
+                         "%lld %lld %lld\n",
+                         pts_sys_time, pts, dpts);
+
                   pData->pstate->frame++;
                }
             }
@@ -2419,7 +2588,9 @@ int main(int argc, const char **argv)
    signal(SIGUSR1, SIG_IGN);
 
    set_app_name(argv[0]);
-
+   
+   printf("Modified by Inatech, commit %s\n", GIT_COMMIT_ID);
+   
    // Do we have any parameters
    if (argc == 1)
    {

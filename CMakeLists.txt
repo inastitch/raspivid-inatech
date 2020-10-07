@@ -130,3 +130,16 @@ if(PKG_CONFIG_FOUND)
 endif()
 # Remove cache entry, if one added by command line
 unset(KHRONOS_EGL_PLATFORM CACHE)
+
+set(CPACK_GENERATOR "DEB")
+set(CPACK_DEBIAN_PACKAGE_MAINTAINER "vjp")
+set(CPACK_DEBIAN_PACKAGE_NAME "libraspberrypi-inatech")
+set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
+# DEB-DEFAULT = <PackageName>_<VersionNumber>-<DebianRevisionNumber>_<DebianArchitecture>.deb
+# See: https://cmake.org/cmake/help/v3.6/module/CPackDeb.html
+
+# Note: RPi OS has 3 packages:
+# libraspberrypi-bin libraspberrypi-doc libraspberrypi-dev
+# This package will provide all as one package.
+
+include(CPack)
